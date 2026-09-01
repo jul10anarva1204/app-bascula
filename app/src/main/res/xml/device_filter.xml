@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ── Báscula Serial (USB-to-Serial) ─────────────────────────────── -->
+    <!-- FTDI FT232 -->
+    <usb-device vendor-id="1027" product-id="24577" />
+    <usb-device vendor-id="1027" product-id="24592" />
+    <!-- Prolific PL2303 -->
+    <usb-device vendor-id="1659" product-id="8963"  />
+    <!-- Silicon Labs CP210x -->
+    <usb-device vendor-id="4292" product-id="60000" />
+    <!-- CH340 -->
+    <usb-device vendor-id="6790" product-id="29987" />
+
+    <!-- ── Impresora USB (Xprinter 365B — Thermal Label) ──────────────── -->
+    <!-- NXP 0x1FC9 -->
+    <usb-device vendor-id="8137" />
+    <!-- STM 0x0483 -->
+    <usb-device vendor-id="1155" />
+    <!-- GigaDevice 0x28E9 -->
+    <usb-device vendor-id="10473" />
+
+    <!-- ── Cámara UVC (Rapoo C500 y cámaras USB Video Class) ──────────── -->
+    <!-- UVC standard: Miscellaneous class=239 (0xEF), subclass=2, protocol=1 (IAD) -->
+    <usb-device class="239" subclass="2" protocol="1" />
+    <!-- UVC Video Control interface class=14 (0x0E) -->
+    <usb-device class="14" subclass="1" />
+    <!-- UVC Video Streaming interface -->
+    <usb-device class="14" subclass="2" />
+    <!-- Rapoo VID: 0x24AE = 9390 decimal -->
+    <usb-device vendor-id="9390" />
+    <!-- Sonix Technology (OEM común en Rapoo) 0x0C45 = 3141 -->
+    <usb-device vendor-id="3141" />
+    <!-- Sunplus 0x1BCF = 7119 -->
+    <usb-device vendor-id="7119" />
+</resources>
