@@ -53,8 +53,7 @@ data class BasculaUiState(
     // Impresora
     val printing: Boolean = false,
     val printResult: String = "",
-    val selectedPrinterVendorId: Int = -1,
-    val selectedPrinterProductId: Int = -1,
+    val selectedPrinterAddress: String = "",   // MAC Bluetooth
     val selectedPrinterName: String = "",
     // Cámara
     val hayCaramaUsb: Boolean = false,
@@ -89,8 +88,8 @@ class BasculaViewModel(application: Application) : AndroidViewModel(application)
 
     val registros = db.registros
 
-    private val _impresoras = MutableStateFlow<List<UsbImpresoraInfo>>(emptyList())
-    val impresoras: StateFlow<List<UsbImpresoraInfo>> = _impresoras.asStateFlow()
+    private val _impresoras = MutableStateFlow<List<BtImpresoraInfo>>(emptyList())
+    val impresoras: StateFlow<List<BtImpresoraInfo>> = _impresoras.asStateFlow()
 
     private val usbManager = application.getSystemService(Context.USB_SERVICE) as UsbManager
     private var serialPort: UsbSerialPort? = null
@@ -110,34 +109,14 @@ class BasculaViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    // ── Receiver: permiso impresora ──────────────────────────────────────────
-    private val printerPermissionReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (ACTION_PRINTER_PERMISSION != intent.action) return
-            val device: UsbDevice? = getDevice(intent)
-            val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-            if (granted && device != null) {
-                prefs.printerVendorId  = device.vendorId
-                prefs.printerProductId = device.productId
-                _uiState.update { it.copy(
-                    selectedPrinterVendorId  = device.vendorId,
-                    selectedPrinterProductId = device.productId
-                )}
-            }
-        }
-    }
-
-    // ── Receiver: desconexión USB ────────────────────────────────────────────
+    // ── Receiver: desconexión USB ───────────────────────────────────────────
     private val usbDetachReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (UsbManager.ACTION_USB_DEVICE_DETACHED != intent.action) return
             // Actualizar disponibilidad de cámara USB
             _uiState.update { it.copy(hayCaramaUsb = cameraCapture.hayCaramaUsb()) }
-            // Si era la báscula, desconectar
-            val device: UsbDevice? = getDevice(intent)
-            if (device != null &&
-                device.vendorId != _uiState.value.selectedPrinterVendorId &&
-                device.productId != _uiState.value.selectedPrinterProductId) {
+            // Si la báscula estaba conectada, desconectar
+            if (_uiState.value.conexion == ConexionEstado.CONECTADO) {
                 detenerAutoLectura()
                 cerrarPuerto()
                 bufferLecturas.clear()
@@ -161,11 +140,10 @@ class BasculaViewModel(application: Application) : AndroidViewModel(application)
     init {
         _uiState.update {
             it.copy(
-                productName              = prefs.productName,
-                selectedPrinterVendorId  = prefs.printerVendorId,
-                selectedPrinterProductId = prefs.printerProductId,
-                selectedPrinterName      = prefs.printerName,
-                hayCaramaUsb             = cameraCapture.hayCaramaUsb()
+                productName           = prefs.productName,
+                selectedPrinterAddress = prefs.printerAddress,
+                selectedPrinterName   = prefs.printerName,
+                hayCaramaUsb          = cameraCapture.hayCaramaUsb()
             )
         }
         registrarReceivers()
@@ -178,8 +156,7 @@ class BasculaViewModel(application: Application) : AndroidViewModel(application)
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
         else PendingIntent.FLAG_UPDATE_CURRENT
 
-        scalePendingIntent   = PendingIntent.getBroadcast(app, 0, Intent(ACTION_USB_PERMISSION), flags)
-        printerPendingIntent = PendingIntent.getBroadcast(app, 1, Intent(ACTION_PRINTER_PERMISSION), flags)
+        scalePendingIntent = PendingIntent.getBroadcast(app, 0, Intent(ACTION_USB_PERMISSION), flags)
 
         fun register(receiver: BroadcastReceiver, filter: IntentFilter) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
@@ -187,7 +164,6 @@ class BasculaViewModel(application: Application) : AndroidViewModel(application)
             else app.registerReceiver(receiver, filter)
         }
         register(usbPermissionReceiver,    IntentFilter(ACTION_USB_PERMISSION))
-        register(printerPermissionReceiver, IntentFilter(ACTION_PRINTER_PERMISSION))
         register(usbDetachReceiver,        IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED))
         register(usbAttachReceiver,        IntentFilter(UsbManager.ACTION_USB_DEVICE_ATTACHED))
     }
@@ -308,10 +284,10 @@ class BasculaViewModel(application: Application) : AndroidViewModel(application)
             _uiState.update { it.copy(guardando = false,
                 ultimoGuardado = "$pesoNeto ${estado.unidad}") }
 
-            // 3. Imprimir etiqueta con peso NETO
-            if (estado.selectedPrinterVendorId != -1) {
+            // 3. Imprimir etiqueta con peso NETO por Bluetooth
+            if (estado.selectedPrinterAddress.isNotEmpty()) {
                 imprimir(pesoNeto, estado.unidad, estado.productName,
-                    estado.selectedPrinterVendorId, estado.selectedPrinterProductId, ts)
+                    estado.selectedPrinterAddress, ts)
             }
 
             delay(3000)
@@ -320,10 +296,10 @@ class BasculaViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun imprimir(peso: String, unidad: String, nombre: String,
-                         vid: Int, pid: Int, timestamp: Long) {
+                         address: String, timestamp: Long) {
         viewModelScope.launch {
             _uiState.update { it.copy(printing = true, printResult = "") }
-            val result = printerManager.imprimirEtiqueta(vid, pid, nombre, peso, unidad, timestamp)
+            val result = printerManager.imprimirEtiqueta(address, nombre, peso, unidad, timestamp)
             _uiState.update { it.copy(printing = false,
                 printResult = if (result.isSuccess) "ok"
                 else "error:${result.exceptionOrNull()?.message}") }
@@ -370,32 +346,24 @@ class BasculaViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(hayCaramaUsb = cameraCapture.hayCaramaUsb()) }
     }
 
-    // ── Impresora USB ────────────────────────────────────────────────────────
+    // ── Impresora Bluetooth ──────────────────────────────────────────
     fun cargarImpresoras() {
         _impresoras.value = printerManager.getDispositivosConectados()
     }
 
-    fun seleccionarImpresora(vendorId: Int, productId: Int, nombre: String) {
-        prefs.printerVendorId  = vendorId
-        prefs.printerProductId = productId
-        prefs.printerName      = nombre
+    fun seleccionarImpresora(address: String, nombre: String) {
+        prefs.printerAddress = address
+        prefs.printerName    = nombre
         _uiState.update { it.copy(
-            selectedPrinterVendorId  = vendorId,
-            selectedPrinterProductId = productId,
-            selectedPrinterName      = nombre
+            selectedPrinterAddress = address,
+            selectedPrinterName    = nombre
         )}
-        val device = printerManager.encontrarDispositivo(vendorId, productId)
-        if (device != null && !printerManager.tienePermiso(device)) {
-            usbManager.requestPermission(device, printerPendingIntent)
-        }
     }
 
     fun limpiarSeleccionImpresora() {
-        prefs.printerVendorId  = -1
-        prefs.printerProductId = -1
-        prefs.printerName      = ""
-        _uiState.update { it.copy(selectedPrinterVendorId = -1,
-            selectedPrinterProductId = -1, selectedPrinterName = "") }
+        prefs.printerAddress = ""
+        prefs.printerName    = ""
+        _uiState.update { it.copy(selectedPrinterAddress = "", selectedPrinterName = "") }
     }
 
     // ── Configuración ────────────────────────────────────────────────────────
@@ -407,6 +375,24 @@ class BasculaViewModel(application: Application) : AndroidViewModel(application)
     // ── DB ───────────────────────────────────────────────────────────────────
     fun eliminarRegistro(id: Long) = viewModelScope.launch(Dispatchers.IO) { db.eliminarPorId(id) }
     fun eliminarTodo()              = viewModelScope.launch(Dispatchers.IO) { db.eliminarTodos() }
+
+    // ── Prueba de impresora ───────────────────────────────────────────────────
+    fun probarImpresora() {
+        val address = _uiState.value.selectedPrinterAddress
+        if (address.isEmpty()) {
+            _uiState.update { it.copy(printResult = "error:Selecciona una impresora primero") }
+            return
+        }
+        viewModelScope.launch {
+            _uiState.update { it.copy(printing = true, printResult = "Probando...") }
+            val result = printerManager.pruebaTextoSimple(address)
+            val msg = if (result.isSuccess) "✓ ${result.getOrDefault("")}"
+                      else "✗ ${result.exceptionOrNull()?.message}"
+            _uiState.update { it.copy(printing = false, printResult = msg) }
+            delay(15000)
+            _uiState.update { it.copy(printResult = "") }
+        }
+    }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
     private fun verificarEstabilidad(pesoTexto: String): Boolean {
@@ -444,8 +430,7 @@ class BasculaViewModel(application: Application) : AndroidViewModel(application)
         detenerAutoLectura()
         cerrarPuerto()
         cameraCapture.release()
-        listOf(usbPermissionReceiver, printerPermissionReceiver,
-               usbDetachReceiver, usbAttachReceiver).forEach {
+        listOf(usbPermissionReceiver, usbDetachReceiver, usbAttachReceiver).forEach {
             try { getApplication<Application>().unregisterReceiver(it) }
             catch (e: Exception) { Log.e(TAG, "Error desregistrando receiver", e) }
         }

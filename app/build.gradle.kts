@@ -100,6 +100,7 @@ dependencies {
   implementation("com.github.jiangdongguo.AndroidUSBCamera:libuvc:3.2.7")
   implementation("com.github.jiangdongguo.AndroidUSBCamera:libuvccommon:3.2.7")
   // Coil — carga de imágenes en Compose (thumbnails de fotos)
+  implementation("com.google.zxing:core:3.5.3")
   implementation("io.coil-kt:coil-compose:2.7.0")
 
   // Coroutines

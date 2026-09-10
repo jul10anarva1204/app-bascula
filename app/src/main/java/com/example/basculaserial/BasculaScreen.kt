@@ -92,6 +92,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
@@ -141,9 +143,23 @@ fun BasculaScreen(viewModel: BasculaViewModel = viewModel()) {
         }
     }
 
-    // Cargar lista de impresoras USB al abrir ajustes
+    // ── Permiso Bluetooth (Android 12+) ──────────────────────────────────
+    val btPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ -> viewModel.cargarImpresoras() }
+
+    // Cargar lista de impresoras BT al abrir ajustes (pidiendo permiso si falta)
     LaunchedEffect(mostrarAjustes) {
-        if (mostrarAjustes) viewModel.cargarImpresoras()
+        if (mostrarAjustes) {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                btPermLauncher.launch(arrayOf(
+                    android.Manifest.permission.BLUETOOTH_CONNECT,
+                    android.Manifest.permission.BLUETOOTH_SCAN
+                ))
+            } else {
+                viewModel.cargarImpresoras()
+            }
+        }
     }
 
     Box(
@@ -361,7 +377,7 @@ fun BasculaScreen(viewModel: BasculaViewModel = viewModel()) {
                         guardando         = uiState.guardando,
                         printing          = uiState.printing,
                         camaraCapturando  = uiState.camaraCapturando,
-                        tienePrinter      = uiState.selectedPrinterVendorId != -1,
+                        tienePrinter      = uiState.selectedPrinterAddress.isNotEmpty(),
                         tieneCarama       = uiState.hayCaramaUsb && uiState.camaraPermiso,
                         onClick           = { viewModel.guardarPeso() }
                     )
@@ -442,9 +458,10 @@ fun BasculaScreen(viewModel: BasculaViewModel = viewModel()) {
             impresoras        = impresoras,
             onDismiss         = { mostrarAjustes = false },
             onSaveName        = { viewModel.actualizarNombreProducto(it) },
-            onSelectPrinter   = { vid, pid, name -> viewModel.seleccionarImpresora(vid, pid, name) },
+            onSelectPrinter   = { address, name -> viewModel.seleccionarImpresora(address, name) },
             onClearPrinter    = { viewModel.limpiarSeleccionImpresora() },
             onRefreshPrinters = { viewModel.cargarImpresoras() },
+            onTestPrinter     = { viewModel.probarImpresora() },
             onRefreshCarama   = { viewModel.verificarCaramaUsb() }
         )
     }
@@ -848,12 +865,13 @@ private fun FilaRegistro(registro: RegistroPeso, onEliminar: () -> Unit) {
 @Composable
 private fun AjustesDialog(
     uiState: BasculaUiState,
-    impresoras: List<UsbImpresoraInfo>,
+    impresoras: List<BtImpresoraInfo>,
     onDismiss: () -> Unit,
     onSaveName: (String) -> Unit,
-    onSelectPrinter: (Int, Int, String) -> Unit,
+    onSelectPrinter: (String, String) -> Unit,   // (address, nombre)
     onClearPrinter: () -> Unit,
     onRefreshPrinters: () -> Unit,
+    onTestPrinter: () -> Unit,
     onRefreshCarama: () -> Unit
 ) {
     var nombre by rememberSaveable { mutableStateOf(uiState.productName) }
@@ -870,7 +888,10 @@ private fun AjustesDialog(
             }
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
 
                 // ── Nombre del producto ──────────────────────────────────
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -952,20 +973,37 @@ private fun AjustesDialog(
 
                 HorizontalDivider(color = Borde)
 
-                // ── Selección de impresora USB ───────────────────────────
+                // ── Selección de impresora Bluetooth ───────────────────────
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Usb, null, tint = Azul, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.Print, null, tint = Azul, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(6.dp))
-                        Text("Impresora USB", color = TextoMedio, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        Text("Impresora Bluetooth", color = TextoMedio, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                     }
                     IconButton(onClick = onRefreshPrinters, modifier = Modifier.size(30.dp)) {
                         Icon(Icons.Default.Refresh, "Actualizar lista", tint = Azul, modifier = Modifier.size(18.dp))
                     }
+                }
+
+                // Aviso de emparejamiento
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color(0xFFE3F2FD))
+                        .padding(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.Usb, null, tint = Azul, modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        "Empareja la impresora en Ajustes → Bluetooth del celular antes de seleccionarla aquí.",
+                        color = Azul, fontSize = 11.sp, lineHeight = 15.sp
+                    )
                 }
 
                 if (impresoras.isEmpty()) {
@@ -977,42 +1015,47 @@ private fun AjustesDialog(
                             .padding(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Default.Usb, null, tint = Ambar, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.Print, null, tint = Ambar, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(8.dp))
-                        Text("Conecta la impresora 365B por USB y toca ↻",
+                        Text("No hay dispositivos Bluetooth emparejados. Ve a Ajustes → Bluetooth y empareja la impresora, luego toca ↻",
                             color = Ambar, fontSize = 12.sp, lineHeight = 17.sp)
                     }
                 } else {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        // Opción: sin impresora
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier.fillMaxWidth()
                                 .clip(RoundedCornerShape(8.dp))
                                 .clickable { onClearPrinter() }.padding(6.dp)
                         ) {
-                            RadioButton(selected = uiState.selectedPrinterVendorId == -1,
+                            RadioButton(
+                                selected = uiState.selectedPrinterAddress.isEmpty(),
                                 onClick = { onClearPrinter() },
-                                colors = RadioButtonDefaults.colors(selectedColor = Azul))
+                                colors = RadioButtonDefaults.colors(selectedColor = Azul)
+                            )
                             Text("Sin impresora", color = TextoMedio, fontSize = 13.sp)
                         }
+                        // Lista de dispositivos Bluetooth emparejados
                         impresoras.forEach { dispositivo ->
-                            val sel = uiState.selectedPrinterVendorId == dispositivo.vendorId &&
-                                    uiState.selectedPrinterProductId == dispositivo.productId
+                            val sel = uiState.selectedPrinterAddress == dispositivo.address
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier.fillMaxWidth()
                                     .clip(RoundedCornerShape(8.dp))
                                     .background(if (sel) Azul.copy(alpha = 0.07f) else Color.Transparent)
-                                    .clickable { onSelectPrinter(dispositivo.vendorId, dispositivo.productId, dispositivo.nombre) }
+                                    .clickable { onSelectPrinter(dispositivo.address, dispositivo.nombre) }
                                     .padding(6.dp)
                             ) {
-                                RadioButton(selected = sel,
-                                    onClick = { onSelectPrinter(dispositivo.vendorId, dispositivo.productId, dispositivo.nombre) },
-                                    colors = RadioButtonDefaults.colors(selectedColor = Azul))
+                                RadioButton(
+                                    selected = sel,
+                                    onClick = { onSelectPrinter(dispositivo.address, dispositivo.nombre) },
+                                    colors = RadioButtonDefaults.colors(selectedColor = Azul)
+                                )
                                 Column {
                                     Text(dispositivo.nombre, color = TextoOscuro, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                                    Text("VID 0x${dispositivo.vendorId.toString(16).uppercase()}  PID 0x${dispositivo.productId.toString(16).uppercase()}",
-                                        color = TextoSuave, fontSize = 10.sp)
+                                    Text(dispositivo.address, color = TextoSuave, fontSize = 10.sp,
+                                        fontFamily = FontFamily.Monospace)
                                 }
                             }
                         }
@@ -1023,13 +1066,48 @@ private fun AjustesDialog(
                     Row(
                         modifier = Modifier.fillMaxWidth()
                             .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xFFE3F2FD)).padding(10.dp),
+                            .background(Color(0xFFE8F5E9)).padding(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Default.Print, null, tint = Azul, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.Print, null, tint = VerdeClaro, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(6.dp))
-                        Text("Seleccionada: ${uiState.selectedPrinterName}",
-                            color = Azul, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                        Column {
+                            Text("✓ Impresora seleccionada:",
+                                color = VerdeClaro, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                            Text(uiState.selectedPrinterName,
+                                color = VerdeClaro, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                        }
+                    }
+
+                    // Botón PROBAR
+                    Button(
+                        onClick  = onTestPrinter,
+                        enabled  = !uiState.printing,
+                        colors   = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
+                        shape    = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Print, null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            if (uiState.printing) "Probando..." else "PROBAR IMPRESORA",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    // Resultado de la prueba
+                    if (uiState.printResult.isNotEmpty()) {
+                        Text(
+                            uiState.printResult,
+                            color    = if (uiState.printResult.startsWith("✓")) VerdeClaro else Color(0xFFD32F2F),
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(Color(0xFFF5F5F5))
+                                .padding(10.dp)
+                        )
                     }
                 }
             }

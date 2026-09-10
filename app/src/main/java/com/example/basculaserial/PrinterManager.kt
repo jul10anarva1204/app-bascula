@@ -1,279 +1,393 @@
 package com.example.basculaserial
 
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothSocket
 import android.content.Context
-import android.hardware.usb.UsbConstants
-import android.hardware.usb.UsbDevice
-import android.hardware.usb.UsbDeviceConnection
-import android.hardware.usb.UsbEndpoint
-import android.hardware.usb.UsbInterface
-import android.hardware.usb.UsbManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Typeface
+import android.util.Log
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.MultiFormatWriter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
-/** Info de una impresora USB detectada */
-data class UsbImpresoraInfo(
+/** Info de una impresora Bluetooth emparejada */
+data class BtImpresoraInfo(
     val nombre: String,
-    val deviceName: String,
-    val vendorId: Int,
-    val productId: Int
+    val address: String
 )
 
 /**
- * Maneja la conexión USB con la impresora térmica 365B (Xprinter XP-365B)
- * y genera comandos TSPL para etiquetas de 38×25 mm.
- *
- * ─ Investigación de drivers ──────────────────────────────────────────────
- *  La XP-365B usa comunicación USB bulk directa (no serial/COM):
- *  • VID conocidos de Xprinter: 0x1FC9 (NXP), 0x0483 (STM), 0x28E9 (GD32),
- *                                0x04B8 (Epson compat.), 0x0FE6 (ICS)
- *  • Protocolo: TSPL (TSC Printer Language) — comandos ASCII + bulk OUT
- *  • Clase USB: generalmente 0x07 (Printer) o 0xFF (Vendor-specific)
- *  • Endpoint: Bulk OUT (interface 0 ó 1, endpoint tipo XFER_BULK DIR_OUT)
- *  • NO requiere usb-serial-for-android (no es un puerto serial)
- *  • NO requiere el SDK de Xprinter — TSPL puro funciona directamente
- *
- *  Para identificar VID/PID del tuyo: conecta al PC → Administrador de
- *  dispositivos → Propiedades → Detalles → IDs de hardware
- * ─────────────────────────────────────────────────────────────────────────
+ * Imprime tickets térmicos por Bluetooth (ESC/POS) usando raster bitmap.
+ * Compatible con: Ofichido POS-5820, Xprinter, GOOJPRT y similares de 58mm.
  */
 class PrinterManager(context: Context) {
 
-    private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+    private val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
 
     companion object {
-        /**
-         * VIDs conocidos de impresoras térmicas Xprinter / similares.
-         * La app mostrará TODOS los dispositivos USB, pero estos se muestran
-         * primero con un indicador de "impresora conocida".
-         */
-        val XPRINTER_VIDS = setOf(
-            0x1FC9,  // NXP Semiconductors — chip más común en XP-365B
-            0x0483,  // STMicroelectronics
-            0x28E9,  // GigaDevice (GD32) — chip chino común
-            0x04B8,  // Seiko Epson (compatibles)
-            0x0FE6,  // ICS Advent
-            0x0416,  // Winbond Electronics
-            0x067B,  // Prolific Technology (PL2303 en modo bulk)
-            0x1A86,  // QinHeng Electronics (CH340 en modo bulk)
-        )
-
-        /** Clase USB de impresora estándar */
-        const val USB_CLASS_PRINTER = 7
+        private const val TAG = "BASCULA_BT"
+        private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+        private const val PRINT_WIDTH = 384
+        private val ESC_INIT = byteArrayOf(0x1B, 0x40)
+        private val ESC_FEED = byteArrayOf(0x0A)
+        private val ESC_CUT  = byteArrayOf(0x1D, 0x56, 0x42, 0x00)
     }
 
-    // ── Detección de dispositivos ────────────────────────────────────────────
+    // ── Detección ──────────────────────────────────────────────────────────────
 
-    /**
-     * Lista todos los dispositivos USB que son probablemente impresoras.
-     * Prioridad: (1) clase USB=Printer, (2) VID conocido de Xprinter,
-     *            (3) cualquier dispositivo con endpoint bulk OUT.
-     * Excluye dispositivos serial/COM (usados por la báscula) cuando
-     * son identificados por usb-serial-for-android.
-     */
-    fun getDispositivosConectados(): List<UsbImpresoraInfo> {
-        val dispositivos = usbManager.deviceList.values.filter { device ->
-            esPosibleImpresora(device)
-        }
-
-        // Ordenar: primero los más probables (clase printer o VID conocido)
-        return dispositivos.sortedByDescending { device ->
-            when {
-                tieneClaseImpresora(device)         -> 2
-                device.vendorId in XPRINTER_VIDS    -> 1
-                else                                -> 0
+    @SuppressLint("MissingPermission")
+    fun getDispositivosConectados(): List<BtImpresoraInfo> {
+        return try {
+            val adapter: BluetoothAdapter = btManager.adapter ?: return emptyList()
+            adapter.bondedDevices.map { device ->
+                BtImpresoraInfo(nombre = device.name ?: "Bluetooth", address = device.address)
             }
-        }.map { device ->
-            val esConocida = device.vendorId in XPRINTER_VIDS || tieneClaseImpresora(device)
-            UsbImpresoraInfo(
-                nombre     = buildNombre(device, esConocida),
-                deviceName = device.deviceName,
-                vendorId   = device.vendorId,
-                productId  = device.productId
-            )
-        }
+        } catch (_: Exception) { emptyList() }
     }
 
-    private fun buildNombre(device: UsbDevice, esConocida: Boolean): String {
-        val base = device.productName?.takeIf { it.isNotBlank() }
-            ?: "USB ${device.vendorId.toString(16).uppercase()}:${device.productId.toString(16).uppercase()}"
-        return if (esConocida) "🖨 $base" else base
-    }
+    // ── Impresión ──────────────────────────────────────────────────────────────
 
-    private fun esPosibleImpresora(device: UsbDevice): Boolean =
-        tieneClaseImpresora(device) ||
-                device.vendorId in XPRINTER_VIDS ||
-                tieneBulkOut(device)
-
-    private fun tieneClaseImpresora(device: UsbDevice): Boolean {
-        if (device.deviceClass == USB_CLASS_PRINTER) return true
-        for (i in 0 until device.interfaceCount) {
-            if (device.getInterface(i).interfaceClass == USB_CLASS_PRINTER) return true
-        }
-        return false
-    }
-
-    /** Busca un dispositivo conectado por VID+PID */
-    fun encontrarDispositivo(vendorId: Int, productId: Int): UsbDevice? =
-        usbManager.deviceList.values.find {
-            it.vendorId == vendorId && it.productId == productId
-        }
-
-    fun tienePermiso(device: UsbDevice) = usbManager.hasPermission(device)
-
-    // ── Impresión ────────────────────────────────────────────────────────────
-
-    /**
-     * Imprime una etiqueta TSPL en la impresora indicada por VID+PID.
-     *
-     * Estrategia de conexión:
-     *  1. Intenta Interface 0 (estándar en la mayoría)
-     *  2. Si falla, prueba todas las interfaces en orden
-     *  3. Envía TSPL en bloques de 4 KB con reintentos
-     */
+    @SuppressLint("MissingPermission")
     suspend fun imprimirEtiqueta(
-        vendorId: Int,
-        productId: Int,
-        nombreProducto: String,
+        address: String,
+        nombre: String,
         peso: String,
         unidad: String,
         timestamp: Long
     ): Result<Unit> = withContext(Dispatchers.IO) {
-        val device = encontrarDispositivo(vendorId, productId)
-            ?: return@withContext Result.failure(Exception(
-                "Impresora no conectada. Verifica el cable USB y el hub OTG."))
+        var socket: BluetoothSocket? = null
+        return@withContext try {
+            Log.d(TAG, "=== IMPRESION TSPL === address=$address")
+            val adapter = btManager.adapter
+                ?: return@withContext Result.failure(Exception("Bluetooth no disponible"))
 
-        if (!usbManager.hasPermission(device)) {
-            return@withContext Result.failure(Exception(
-                "Sin permiso USB para la impresora. Abre Ajustes → vuelve a seleccionarla."))
+            val device = adapter.getRemoteDevice(address)
+            adapter.cancelDiscovery()
+
+            socket = try {
+                device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+            } catch (e: Exception) {
+                device.createRfcommSocketToServiceRecord(SPP_UUID)
+            }
+            socket.connect()
+            Log.d(TAG, "Conectado ✓")
+            Thread.sleep(500)
+
+            val fecha = SimpleDateFormat("dd/MM/yy  HH:mm", Locale.getDefault()).format(Date(timestamp))
+            // Sanitizar nombre para TSPL (quitar comillas dobles)
+            val nombreSafe = nombre.replace("\"", "'").take(18)
+            val pesoSafe   = "$peso $unidad"
+            val qrData     = "$nombreSafe|$peso|$unidad|$fecha"
+
+            // ── Etiqueta TSPL 40×30 mm ────────────────────────────────────────
+            val nombreCorto = nombreSafe.take(14)
+            val tspl = buildString {
+                append("SIZE 40 mm,30 mm\n")
+                append("GAP 2 mm,0 mm\n")
+                append("DIRECTION 0\n")
+                append("CLS\n")
+                // Título izquierda
+                append("TEXT 5,5,\"4\",0,1,1,\"$nombreCorto\"\n")
+                // Peso
+                append("TEXT 5,35,\"3\",0,2,1,\"$peso\"\n")
+                // Unidad
+                append("TEXT 5,60,\"3\",0,1,1,\"$unidad\"\n")
+                // QR centrado
+                append("QRCODE 107,72,H,5,M,0,\"$peso $unidad\"\n")
+                // Fecha más abajo (y=215)
+                append("TEXT 5,215,\"3\",0,1,1,\"$fecha\"\n")
+                append("PRINT 1,1\n")
+            }
+
+            val out = socket.outputStream
+            out.write(tspl.toByteArray(Charsets.US_ASCII))
+            out.flush()
+            Log.d(TAG, "TSPL enviado: ${tspl.length} chars ✓")
+
+            Thread.sleep(3000)
+            Log.d(TAG, "=== FIN OK ===")
+            Result.success(Unit)
+        } catch (e: IOException) {
+            Log.e(TAG, "IOException: ${e.message}", e)
+            Result.failure(Exception("Error BT: ${e.message}"))
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException: ${e.message}", e)
+            Result.failure(Exception("Sin permiso Bluetooth"))
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception: ${e.message}", e)
+            Result.failure(Exception("Error: ${e.message}"))
+        } finally {
+            try { socket?.close(); Log.d(TAG, "Socket cerrado") } catch (_: Exception) {}
         }
-
-        val tspl = buildTsplLabel(nombreProducto, peso, unidad, timestamp)
-        val data = tspl.toByteArray(Charsets.US_ASCII)
-
-        return@withContext enviarPorUsb(device, data)
     }
 
-    private suspend fun enviarPorUsb(device: UsbDevice, data: ByteArray): Result<Unit> =
-        withContext(Dispatchers.IO) {
-            var connection: UsbDeviceConnection? = null
-            try {
-                connection = usbManager.openDevice(device)
-                    ?: return@withContext Result.failure(Exception("No se pudo abrir la impresora USB"))
+    /** Prueba TSPL — protocolo de impresoras de etiquetas ZJiang */
+    @SuppressLint("MissingPermission")
+    suspend fun pruebaTextoSimple(address: String): Result<String> = withContext(Dispatchers.IO) {
+        var socket: BluetoothSocket? = null
+        val log = StringBuilder()
+        return@withContext try {
+            val adapter = btManager.adapter
+                ?: return@withContext Result.failure(Exception("BT no disponible"))
+            val device = adapter.getRemoteDevice(address)
+            adapter.cancelDiscovery()
 
-                // Buscar endpoint bulk OUT en todas las interfaces
-                for (ifaceIdx in 0 until device.interfaceCount) {
-                    val iface = device.getInterface(ifaceIdx)
-                    val bulkOut = (0 until iface.endpointCount)
-                        .map { iface.getEndpoint(it) }
-                        .firstOrNull {
-                            it.type == UsbConstants.USB_ENDPOINT_XFER_BULK &&
-                                    it.direction == UsbConstants.USB_DIR_OUT
-                        } ?: continue
-
-                    if (!connection.claimInterface(iface, true)) continue
-
-                    // Enviar datos en bloques de 4 KB
-                    var offset = 0
-                    var ok = true
-                    while (offset < data.size) {
-                        val chunk = minOf(data.size - offset, 4096)
-                        val sent  = connection.bulkTransfer(bulkOut, data, offset, chunk, 5000)
-                        if (sent < 0) { ok = false; break }
-                        offset += sent
-                    }
-
-                    connection.releaseInterface(iface)
-
-                    return@withContext if (ok) Result.success(Unit)
-                    else Result.failure(Exception("Error en la transferencia de datos al imprimir"))
-                }
-
-                Result.failure(Exception("No se encontró endpoint de impresión en el dispositivo"))
+            log.append("1. Creando socket...\n")
+            socket = try {
+                device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
             } catch (e: Exception) {
-                Result.failure(e)
-            } finally {
-                try { connection?.close() } catch (_: Exception) { }
+                log.append("   inseguro falló → usando seguro\n")
+                device.createRfcommSocketToServiceRecord(SPP_UUID)
             }
-        }
 
-    // ── Generador de etiqueta TSPL ───────────────────────────────────────────
+            log.append("2. Conectando...\n")
+            socket.connect()
+            log.append("3. CONECTADO ✓\n")
+
+            Thread.sleep(1500)
+            val out = socket.outputStream
+
+            // ── TSPL (protocolo de etiquetas ZJiang) ─────────────────────────
+            log.append("4. Enviando TSPL...\n")
+            val tspl = buildString {
+                append("SIZE 48 mm,30 mm\n")
+                append("GAP 2 mm,0 mm\n")
+                append("DIRECTION 1\n")
+                append("CLS\n")
+                append("TEXT 5,10,\"3\",0,1,1,\"PRUEBA IMPRESION\"\n")
+                append("TEXT 5,60,\"3\",0,1,1,\"Bascula App OK\"\n")
+                append("PRINT 1,1\n")
+            }
+            val tsplBytes = tspl.toByteArray(Charsets.US_ASCII)
+            out.write(tsplBytes)
+            out.flush()
+            log.append("5. TSPL enviado (${tsplBytes.size} bytes) ✓\n")
+
+            Thread.sleep(5000)
+
+            // ── ESC/POS texto (fallback) ──────────────────────────────────────
+            log.append("6. Enviando ESC/POS texto...\n")
+            val buf = java.io.ByteArrayOutputStream()
+            buf.write(byteArrayOf(0x1B, 0x40))          // ESC @ init
+            buf.write(byteArrayOf(0x0A))                // LF
+            buf.write("PRUEBA ESCPOS\n".toByteArray())
+            buf.write(byteArrayOf(0x0A, 0x0A, 0x0A))    // 3 LF
+            buf.write(byteArrayOf(0x1B, 0x4A, 80.toByte())) // ESC J 80
+            out.write(buf.toByteArray())
+            out.flush()
+            log.append("7. ESC/POS enviado ✓\n")
+
+            Thread.sleep(5000)
+            log.append("8. Listo — revisa si imprimio algo\n")
+            Result.success(log.toString())
+        } catch (e: Exception) {
+            log.append("ERROR: ${e.javaClass.simpleName}: ${e.message}\n")
+            Log.e(TAG, "Prueba error", e)
+            Result.failure(Exception(log.toString()))
+        } finally {
+            try { socket?.close() } catch (_: Exception) {}
+        }
+    }
+
+    // ── Renderizado del ticket ─────────────────────────────────────────────────
 
     /**
-     * Construye comandos TSPL para etiqueta 38×25 mm a 203 DPI.
-     *
-     *  38 mm = 304 dots de ancho
-     *  25 mm = 200 dots de alto
-     *
-     *  Layout (módulo QR=5 → 21×5=105 dots):
-     *   y=4   Nombre del producto  (font "2", ~13 dots/char, alto ~20 dots)
-     *   y=27  Código QR centrado   (módulo 5 dots → 105×105 dots)
-     *   y=135 Peso + unidad        (font "2")
-     *   y=158 Fecha y hora         (font "1", ~9 dots/char)
-     *
-     *  El QR solo contiene el número (sin "kg") para mayor legibilidad.
+     * Dibuja el ticket en un Bitmap usando Canvas de Android.
+     * Ancho = PRINT_WIDTH px (384 para 58mm).
      */
-    private fun buildTsplLabel(
-        nombreProducto: String,
+    private fun renderTicket(
+        nombre: String,
         peso: String,
         unidad: String,
         timestamp: Long
-    ): String {
-        val sdf       = SimpleDateFormat("dd/MM/yyyy  HH:mm:ss", Locale.getDefault())
-        val fechaHora = sdf.format(Date(timestamp))
+    ): Bitmap {
+        val fecha = SimpleDateFormat("dd/MM/yyyy  HH:mm", Locale.getDefault()).format(Date(timestamp))
+        val w     = PRINT_WIDTH
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
 
-        // QR solo con el número, sin unidades
-        val qrContent = peso
+        // Medir altura total primero
+        var y     = 20f
+        val pad   = 10f
 
-        val W = 304  // ancho de etiqueta en dots
+        // Crear bitmap temporal grande
+        val tmp = Bitmap.createBitmap(w, w * 4, Bitmap.Config.ARGB_8888)
+        val c   = Canvas(tmp)
+        c.drawColor(Color.WHITE)
 
-        fun centrarX(chars: Int, dotsPerChar: Int) =
-            maxOf(0, (W - chars * dotsPerChar) / 2)
+        // ── Nombre empresa (centrado, negrita) ────────────────────────────
+        paint.typeface  = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        paint.textSize  = 32f
+        paint.color     = Color.BLACK
+        paint.textAlign = Paint.Align.CENTER
+        c.drawText(nombre.take(24).uppercase(), w / 2f, y + paint.textSize, paint)
+        y += paint.textSize + pad
 
-        val nombre  = nombreProducto.take(22).uppercase(Locale.getDefault())
-        val nombreX = centrarX(nombre.length, 13)
+        // ── Separador ─────────────────────────────────────────────────────
+        y += 6f
+        paint.typeface  = Typeface.MONOSPACE
+        paint.textSize  = 22f
+        paint.textAlign = Paint.Align.CENTER
+        c.drawText("─".repeat(24), w / 2f, y + paint.textSize, paint)
+        y += paint.textSize + 6f
 
-        // Módulo 5 → QR de 105×105 dots (21 módulos × 5 dots)
-        val qrModulo = 5
-        val qrSize   = 21 * qrModulo  // = 105 dots
-        val qrX      = (W - qrSize) / 2   // centrado: (304-105)/2 = 99
+        // ── Peso (grande) ─────────────────────────────────────────────────
+        paint.typeface  = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        paint.textSize  = 90f
+        paint.textAlign = Paint.Align.CENTER
+        c.drawText(peso, w / 2f, y + paint.textSize, paint)
+        y += paint.textSize + 4f
 
-        val pesoTxt = "$peso $unidad"
-        val pesoX   = centrarX(pesoTxt.length, 13)
-        val fechaX  = centrarX(fechaHora.length, 9)
+        // ── Unidad ────────────────────────────────────────────────────────
+        paint.typeface  = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        paint.textSize  = 36f
+        paint.textAlign = Paint.Align.CENTER
+        c.drawText(unidad.uppercase(), w / 2f, y + paint.textSize, paint)
+        y += paint.textSize + 10f
 
-        return buildString {
-            appendLine("SIZE 38 mm,25 mm")
-            appendLine("GAP 2 mm,0")
-            appendLine("DIRECTION 0,0")
-            appendLine("DENSITY 8,A")
-            appendLine("SET PEEL OFF")
-            appendLine("SET CUTTER OFF")
-            appendLine("CLS")
-            // Nombre del producto
-            appendLine("""TEXT $nombreX,4,"2",0,1,1,"$nombre"""")
-            // QR grande (módulo 5) con solo el número
-            appendLine("""QRCODE $qrX,27,L,$qrModulo,A,0,"$qrContent"""")
-            // Peso + unidad debajo del QR
-            appendLine("""TEXT $pesoX,135,"2",0,1,1,"$pesoTxt"""")
-            // Fecha y hora al fondo
-            appendLine("""TEXT $fechaX,158,"1",0,1,1,"$fechaHora"""")
-            appendLine("PRINT 1,1")
-        }
+        // ── Separador ─────────────────────────────────────────────────────
+        paint.typeface  = Typeface.MONOSPACE
+        paint.textSize  = 22f
+        c.drawText("─".repeat(24), w / 2f, y + paint.textSize, paint)
+        y += paint.textSize + 14f
+
+        // ── QR del peso ───────────────────────────────────────────────────
+        val qrSize = 200
+        try {
+            val hints = mapOf(EncodeHintType.MARGIN to 1)
+            val matrix = MultiFormatWriter().encode("$peso $unidad", BarcodeFormat.QR_CODE, qrSize, qrSize, hints)
+            val qrBmp  = Bitmap.createBitmap(qrSize, qrSize, Bitmap.Config.ARGB_8888)
+            for (qx in 0 until qrSize)
+                for (qy in 0 until qrSize)
+                    qrBmp.setPixel(qx, qy, if (matrix[qx, qy]) Color.BLACK else Color.WHITE)
+            val qrX = (w - qrSize) / 2f
+            c.drawBitmap(qrBmp, qrX, y, null)
+            y += qrSize + 14f
+            qrBmp.recycle()
+        } catch (_: Exception) { /* Sin QR si falla */ }
+
+        // ── Separador ─────────────────────────────────────────────────────
+        paint.typeface  = Typeface.MONOSPACE
+        paint.textSize  = 22f
+        c.drawText("─".repeat(24), w / 2f, y + paint.textSize, paint)
+        y += paint.textSize + 10f
+
+        // ── Fecha y hora ──────────────────────────────────────────────────
+        paint.typeface  = Typeface.MONOSPACE
+        paint.textSize  = 24f
+        paint.textAlign = Paint.Align.CENTER
+        c.drawText(fecha, w / 2f, y + paint.textSize, paint)
+        y += paint.textSize + 20f
+
+        // Recortar al tamaño real
+        val height = y.toInt().coerceAtMost(tmp.height)
+        val result = Bitmap.createBitmap(tmp, 0, 0, w, height)
+        tmp.recycle()
+        return result
     }
 
-    /** Verifica si un dispositivo tiene al menos un endpoint bulk OUT */
-    private fun tieneBulkOut(device: UsbDevice): Boolean {
-        for (i in 0 until device.interfaceCount) {
-            val iface = device.getInterface(i)
-            for (j in 0 until iface.endpointCount) {
-                val ep = iface.getEndpoint(j)
-                if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK &&
-                    ep.direction == UsbConstants.USB_DIR_OUT) return true
+    // ── Conversión Bitmap → GS v 0 por filas (= eachLinePixToCmd) ─────────────
+
+    /**
+     * Replica exacta de eachLinePixToCmd de la app de referencia.
+     * Crea UN comando GS v 0 por fila (yL=1, yH=0).
+     * Esto es más compatible con impresoras térmicas baratas.
+     */
+    private fun bitmapToRasterPerRow(bitmap: Bitmap): ByteArray {
+        val w      = bitmap.width
+        val h      = bitmap.height
+        val wBytes = w / 8            // bytes por fila = 384/8 = 48
+
+        // Por cada fila: 8 bytes cabecera + wBytes datos
+        val rowSize = 8 + wBytes
+        val result  = ByteArray(h * rowSize)
+
+        for (row in 0 until h) {
+            val base = row * rowSize
+            // Cabecera GS v 0
+            result[base + 0] = 0x1D.toByte()  // GS
+            result[base + 1] = 0x76.toByte()  // v
+            result[base + 2] = 0x30.toByte()  // 0
+            result[base + 3] = 0x00.toByte()  // modo 0
+            result[base + 4] = (wBytes and 0xFF).toByte()   // xL
+            result[base + 5] = (wBytes shr 8  and 0xFF).toByte() // xH
+            result[base + 6] = 0x01.toByte()  // yL = 1 fila
+            result[base + 7] = 0x00.toByte()  // yH = 0
+
+            // Datos: 8 píxeles → 1 byte (MSB primero = pixel más a la izquierda)
+            for (col in 0 until wBytes) {
+                var byte = 0
+                for (bit in 0 until 8) {
+                    val px  = col * 8 + bit
+                    if (px < w) {
+                        val pixel = bitmap.getPixel(px, row)
+                        val lum   = Color.red(pixel) * 0.299 +
+                                    Color.green(pixel) * 0.587 +
+                                    Color.blue(pixel) * 0.114
+                        if (lum < 128.0) byte = byte or (1 shl (7 - bit))
+                    }
+                }
+                result[base + 8 + col] = byte.toByte()
             }
         }
-        return false
+        return result
+    }
+
+    // ── Ticket de texto ESC/POS (sin bitmap) ──────────────────────────────────
+
+    /**
+     * Ticket de texto puro — máxima compatibilidad con impresoras ESC/POS baratas.
+     * Usa codificación GBK igual que la app de referencia.
+     */
+    private fun buildTicketTexto(
+        out: OutputStream,
+        nombre: String,
+        peso: String,
+        unidad: String,
+        timestamp: Long
+    ) {
+        val fecha = SimpleDateFormat("dd/MM/yyyy  HH:mm", Locale.getDefault()).format(Date(timestamp))
+
+        fun cmd(vararg b: Int) = out.write(b.map { it.toByte() }.toByteArray())
+        fun txt(s: String) { out.write(s.toByteArray(Charsets.UTF_8)); out.write(0x0A) }
+
+        // Centrar
+        cmd(0x1B, 0x61, 0x01)
+        // Negrita ON
+        cmd(0x1B, 0x45, 0x01)
+        txt(nombre.take(32).uppercase())
+        // Negrita OFF
+        cmd(0x1B, 0x45, 0x00)
+
+        txt("--------------------------------")
+
+        // Peso en tamaño GRANDE (doble alto + ancho)
+        cmd(0x1D, 0x21, 0x11)
+        cmd(0x1B, 0x45, 0x01)
+        txt("$peso")
+        cmd(0x1B, 0x45, 0x00)
+
+        // Unidad tamaño normal
+        cmd(0x1D, 0x21, 0x01)
+        txt(unidad.uppercase())
+        cmd(0x1D, 0x21, 0x00)
+
+        txt("--------------------------------")
+
+        // Fecha
+        txt(fecha)
     }
 }

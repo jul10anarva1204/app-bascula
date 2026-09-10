@@ -10,14 +10,10 @@ class PrefsManager(context: Context) {
         get() = prefs.getString("product_name", "MI EMPRESA") ?: "MI EMPRESA"
         set(value) = prefs.edit().putString("product_name", value).apply()
 
-    // Impresora USB identificada por VendorId + ProductId
-    var printerVendorId: Int
-        get() = prefs.getInt("printer_vendor_id", -1)
-        set(value) = prefs.edit().putInt("printer_vendor_id", value).apply()
-
-    var printerProductId: Int
-        get() = prefs.getInt("printer_product_id", -1)
-        set(value) = prefs.edit().putInt("printer_product_id", value).apply()
+    // Impresora Bluetooth identificada por dirección MAC
+    var printerAddress: String
+        get() = prefs.getString("printer_address", "") ?: ""
+        set(value) = prefs.edit().putString("printer_address", value).apply()
 
     var printerName: String
         get() = prefs.getString("printer_name", "") ?: ""
