@@ -61,6 +61,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.RadioButton
@@ -122,7 +123,10 @@ private val fmtFecha = SimpleDateFormat("dd/MM/yyyy  HH:mm:ss", Locale.getDefaul
 
 // ── Pantalla principal ───────────────────────────────────────────────────────
 @Composable
-fun BasculaScreen(viewModel: BasculaViewModel = viewModel()) {
+fun BasculaScreen(
+    viewModel: BasculaViewModel = viewModel(),
+    onNavigateToBarcode: () -> Unit = {}
+) {
     val uiState    by viewModel.uiState.collectAsState()
     val registros  by viewModel.registros.collectAsState()
     val impresoras by viewModel.impresoras.collectAsState()
@@ -230,9 +234,6 @@ fun BasculaScreen(viewModel: BasculaViewModel = viewModel()) {
                             }
                         }
                         EstadoBadgeChip(uiState)
-                        IconButton(onClick = { mostrarAjustes = true }) {
-                            Icon(Icons.Default.Settings, "Ajustes", tint = TextoMedio, modifier = Modifier.size(22.dp))
-                        }
                     }
                 }
             }
@@ -411,6 +412,35 @@ fun BasculaScreen(viewModel: BasculaViewModel = viewModel()) {
                         ) {
                             Icon(Icons.Default.Refresh, null, tint = TextoMedio, modifier = Modifier.size(20.dp))
                         }
+                    }
+                }
+            }
+
+            // ── BOTONES DE ACCESO RÁPIDO ──────────────────────────────────
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onNavigateToBarcode,
+                        modifier = Modifier.weight(1f).height(48.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.5.dp, AzulClaro)
+                    ) {
+                        Icon(Icons.Default.QrCodeScanner, null, tint = AzulClaro, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Códigos\nde Barras", color = AzulClaro, fontWeight = FontWeight.SemiBold, fontSize = 12.sp, lineHeight = 14.sp)
+                    }
+                    OutlinedButton(
+                        onClick = { mostrarAjustes = true },
+                        modifier = Modifier.weight(1f).height(48.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.5.dp, TextoMedio)
+                    ) {
+                        Icon(Icons.Default.Settings, null, tint = TextoMedio, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Ajustes", color = TextoMedio, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
                     }
                 }
             }

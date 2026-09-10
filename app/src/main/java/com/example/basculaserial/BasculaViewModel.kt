@@ -62,7 +62,10 @@ data class BasculaUiState(
     // Configuración
     val productName: String = "MI EMPRESA",
     // Escaner de código de barras
-    val codigoEscaneado: String = ""   // último código leído (se limpia automáticamente)
+    val codigoEscaneado: String = "",  // último código leído (se limpia automáticamente)
+    // Módulo de códigos de barras
+    val barcodePrinting: Boolean = false,
+    val barcodeResult: String = ""
 ) {
     /** Peso neto = bruto − tara (lo que se guarda e imprime) */
     val pesoNeto: String get() {
@@ -391,6 +394,28 @@ class BasculaViewModel(application: Application) : AndroidViewModel(application)
             _uiState.update { it.copy(printing = false, printResult = msg) }
             delay(15000)
             _uiState.update { it.copy(printResult = "") }
+        }
+    }
+
+    // ── Módulo de Códigos de Barras ──────────────────────────────────────────
+    fun imprimirCodigoBarras(nombre: String, codigo: String) {
+        val address = _uiState.value.selectedPrinterAddress
+        if (address.isEmpty()) {
+            _uiState.update { it.copy(barcodeResult = "✗ Selecciona una impresora en Ajustes") }
+            return
+        }
+        if (codigo.isBlank()) {
+            _uiState.update { it.copy(barcodeResult = "✗ Ingresa un código de barras") }
+            return
+        }
+        viewModelScope.launch {
+            _uiState.update { it.copy(barcodePrinting = true, barcodeResult = "Imprimiendo...") }
+            val result = printerManager.imprimirCodigoBarras(address, nombre, codigo)
+            val msg = if (result.isSuccess) "✓ Impreso correctamente"
+                      else "✗ ${result.exceptionOrNull()?.message}"
+            _uiState.update { it.copy(barcodePrinting = false, barcodeResult = msg) }
+            delay(5000)
+            _uiState.update { it.copy(barcodeResult = "") }
         }
     }
 

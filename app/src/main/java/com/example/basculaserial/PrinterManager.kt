@@ -135,6 +135,98 @@ class PrinterManager(context: Context) {
         }
     }
 
+    // ── Código de Barras Code 128 ─────────────────────────────────────────────
+
+    @SuppressLint("MissingPermission")
+    suspend fun imprimirCodigoBarras(
+        address: String,
+        nombre: String,
+        codigo: String
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        var socket: BluetoothSocket? = null
+        return@withContext try {
+            val adapter = btManager.adapter
+                ?: return@withContext Result.failure(Exception("BT no disponible"))
+            val device = adapter.getRemoteDevice(address)
+            adapter.cancelDiscovery()
+
+            socket = try {
+                device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+            } catch (e: Exception) {
+                device.createRfcommSocketToServiceRecord(SPP_UUID)
+            }
+            socket.connect()
+            Log.d(TAG, "Barcode: conectado ✓")
+            Thread.sleep(500)
+
+            val nombreSafe = nombre.replace("\"", "'").take(14)
+            val codigoSafe = codigo.replace("\"", "").replace("\\", "").take(60)
+
+            val tspl = buildString {
+                append("SIZE 40 mm,30 mm\n")
+                append("GAP 2 mm,0 mm\n")
+                append("DIRECTION 0\n")
+                append("CLS\n")
+                // Nombre del producto arriba
+                append("TEXT 5,5,\"4\",0,1,1,\"$nombreSafe\"\n")
+            }
+
+            // ── Generar Code 128 directo al tamaño final ───────────────────
+            // ZXing escala los módulos y agrega las quiet zones automáticamente
+            val bmpW = 240          // dots ancho (~30mm)
+            val bmpH = 60           // dots alto (~7mm)
+            val hints = mapOf(
+                EncodeHintType.MARGIN to 10,            // 10 dots quiet zone cada lado
+                EncodeHintType.CHARACTER_SET to "ISO-8859-1"
+            )
+            val matrix = MultiFormatWriter().encode(
+                codigoSafe, BarcodeFormat.CODE_128, bmpW, bmpH, hints
+            )
+            Log.d(TAG, "Barcode matrix: ${matrix.width}×${matrix.height}")
+
+            // ── Convertir BitMatrix → bytes TSPL BITMAP (POLARIDAD INVERTIDA) ─
+            // En esta impresora bit=0=negro, bit=1=blanco → invertir la convención
+            val widthBytes = (matrix.width + 7) / 8
+            val bitmapData = ByteArray(widthBytes * matrix.height) { 0xFF.toByte() } // inicio: todo blanco
+            for (y in 0 until matrix.height) {
+                for (x in 0 until matrix.width) {
+                    if (matrix.get(x, y)) {          // negro en ZXing → limpiar bit (0=negro)
+                        val idx = y * widthBytes + x / 8
+                        bitmapData[idx] = (bitmapData[idx].toInt() and (0x80 shr (x % 8)).inv()).toByte()
+                    }
+                }
+            }
+
+            // ── Centrar en etiqueta de 320 dots ────────────────────────────
+            val barcodeX = (320 - matrix.width) / 2    // ~10 dots cada lado
+            val barcodeY = 70
+            val textX    = maxOf(5, (320 - codigoSafe.length * 12) / 2)
+
+            // ── Enviar TSPL ─────────────────────────────────────────────────
+            val bitmapCmd = "BITMAP $barcodeX,$barcodeY,$widthBytes,${matrix.height},0,".toByteArray(Charsets.US_ASCII)
+            val footer    = "\r\nTEXT $textX,${barcodeY + matrix.height + 5},\"3\",0,1,1,\"$codigoSafe\"\r\nPRINT 1,1\r\n"
+                                .toByteArray(Charsets.US_ASCII)
+
+            val out = socket.outputStream
+            out.write(tspl.toByteArray(Charsets.US_ASCII))
+            out.write(bitmapCmd)
+            out.write(bitmapData)
+            out.write(footer)
+            out.flush()
+            Log.d(TAG, "Barcode enviado: widthBytes=$widthBytes h=${matrix.height} x=$barcodeX y=$barcodeY ✓")
+            Thread.sleep(3000)
+            Result.success(Unit)
+        } catch (e: IOException) {
+            Log.e(TAG, "Barcode IOException: ${e.message}", e)
+            Result.failure(Exception("Error BT: ${e.message}"))
+        } catch (e: Exception) {
+            Log.e(TAG, "Barcode Exception: ${e.message}", e)
+            Result.failure(Exception("Error: ${e.message}"))
+        } finally {
+            try { socket?.close() } catch (_: Exception) {}
+        }
+    }
+
     /** Prueba TSPL — protocolo de impresoras de etiquetas ZJiang */
     @SuppressLint("MissingPermission")
     suspend fun pruebaTextoSimple(address: String): Result<String> = withContext(Dispatchers.IO) {
